@@ -179,27 +179,54 @@ def run_digest(date: str | None = None, trigger: str = "manual", force: bool = F
         stats["date"] = digest_date
         stats["total"] = len(wanted)
 
-        # 2) 元数据（已入库的跳过）
+        # 2) 元数据（已入库的跳过）：列表页已有标题/作者/comments；摘要优先取 RSS（最新一天），缺的才调 arXiv API
         existing = {r["arxiv_id"] for r in db.query(
-            f"SELECT arxiv_id FROM papers WHERE arxiv_id IN ({','.join('?' * len(wanted))})", tuple(wanted))}
+            f"SELECT arxiv_id FROM papers WHERE abstract != '' AND arxiv_id IN ({','.join('?' * len(wanted))})",
+            tuple(wanted))}  # 之前缺摘要的论文会重新补取
         new_ids = [i for i in wanted if i not in existing]
-        progress.update("arxiv", stage=f"获取 {len(new_ids)} 篇论文元数据")
-        metas = arxiv.fetch_metadata(new_ids) if new_ids else []
         stats["new"] = len(new_ids)
+        metas = {i: dict(wanted[i]) for i in new_ids}
+        if any(not m.get("abstract") for m in metas.values()):
+            progress.update("arxiv", stage=f"获取 {len(new_ids)} 篇论文摘要")
+            for cat in cfg["categories"]:
+                try:
+                    rss_day, rss_entries = arxiv.fetch_rss(cat)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("RSS 获取失败：%s", e)
+                    continue
+                if rss_day != digest_date:
+                    continue
+                for e in rss_entries:
+                    m = metas.get(e["id"])
+                    if m is not None and not m.get("abstract"):
+                        m.update({k: v for k, v in e.items() if v and (k == "abstract" or not m.get(k))})
+            missing = [i for i, m in metas.items() if not m.get("abstract")]
+            if missing:
+                progress.update("arxiv", stage=f"从 arXiv API 获取 {len(missing)} 篇摘要")
+                try:
+                    for a in arxiv.fetch_metadata(missing):
+                        if a["id"] in metas:
+                            metas[a["id"]].update({k: v for k, v in a.items() if v})
+                except Exception as e:  # noqa: BLE001
+                    stats["warning"] = f"{len(missing)} 篇摘要获取失败（{e}），这些论文只按标题匹配"
+                    log.warning(stats["warning"])
         topics = settings["topics"]
         with db.tx() as conn:
-            for m in metas:
-                w = wanted.get(m["id"], {})
-                mt = arxiv.match_topics(m["title"], m["abstract"], topics)
+            for m in metas.values():
+                mt = arxiv.match_topics(m.get("title", ""), m.get("abstract", ""), topics)
                 conn.execute(
-                    """INSERT OR IGNORE INTO papers(arxiv_id, version, digest_date, category, announce_type, title,
+                    """INSERT INTO papers(arxiv_id, version, digest_date, category, announce_type, title,
                        authors, abstract, comments, subjects, published, matched, score, matched_keywords,
-                       matched_topics, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (m["id"], m["version"], digest_date, w.get("category"), w.get("announce_type"), m["title"],
-                     json.dumps(m["authors"], ensure_ascii=False), m["abstract"], m["comments"],
-                     ", ".join(m["subjects"]), m["published"], int(mt["matched"]), mt["score"],
-                     json.dumps(mt["keywords"], ensure_ascii=False), json.dumps(mt["topics"], ensure_ascii=False),
-                     db.now_iso(), db.now_iso()))
+                       matched_topics, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(arxiv_id) DO UPDATE SET abstract=excluded.abstract, matched=excluded.matched,
+                       score=excluded.score, matched_keywords=excluded.matched_keywords,
+                       matched_topics=excluded.matched_topics, updated_at=excluded.updated_at
+                       WHERE papers.abstract = '' AND excluded.abstract != ''""",
+                    (m["id"], m.get("version", ""), digest_date, m.get("category"), m.get("announce_type"),
+                     m.get("title", ""), json.dumps(m.get("authors", []), ensure_ascii=False), m.get("abstract", ""),
+                     m.get("comments", ""), ", ".join(m.get("subjects", [])), m.get("published", ""),
+                     int(mt["matched"]), mt["score"], json.dumps(mt["keywords"], ensure_ascii=False),
+                     json.dumps(mt["topics"], ensure_ascii=False), db.now_iso(), db.now_iso()))
         if force:  # 关键词改过之后重新匹配当天全部论文
             rematch_date(digest_date)
 
@@ -251,6 +278,8 @@ def run_digest(date: str | None = None, trigger: str = "manual", force: bool = F
         if (trigger == "schedule" and new_ids) or trigger == "manual-notify":
             notify.send_digest(digest_date)
         msg = f"{digest_date}：共 {stats['total']} 篇，相关 {stats['matched']} 篇"
+        if stats.get("warning"):
+            msg += f"；注意：{stats['warning']}"
         db.finish_run(run_id, "ok", msg, stats)
         progress.update("arxiv", running=False, stage="完成", message=msg)
         return {"status": "ok", "message": msg, **stats}

@@ -18,7 +18,10 @@ API_URL = "https://export.arxiv.org/api/query"
 # ---------------------------------------------------------------- 列表
 
 def fetch_recent_days(cat: str) -> dict[str, list[dict]]:
-    """解析 /list/{cat}/recent，返回 {公告日期: [{id, title, announce_type}]}，按日期倒序。"""
+    """解析 /list/{cat}/recent，返回 {公告日期: [条目]}。
+
+    条目已含标题、作者、comments、分类，只缺摘要（摘要由 RSS 或 API 补）。
+    """
     html = net.get(RECENT_URL.format(cat=cat), timeout=60).text
     soup = BeautifulSoup(html, "lxml")
     days: dict[str, list[dict]] = {}
@@ -34,17 +37,41 @@ def fetch_recent_days(cat: str) -> dict[str, list[dict]]:
                 a = dt.find("a", title="Abstract")
                 if not a:
                     continue
-                aid = a.get("id") or a.get_text(strip=True).replace("arXiv:", "")
+                aid = (a.get("id") or a.get_text(strip=True).replace("arXiv:", "")).strip()
                 dd = dt.find_next_sibling("dd")
-                primary = dd.select_one(".primary-subject") if dd else None
-                is_cross = bool(primary) and f"({cat})" not in primary.get_text()
-                entries.append({"id": aid.strip(), "announce_type": "cross" if is_cross else "new"})
+                entries.append({"id": aid, **_parse_dd(dd, cat)})
         days.setdefault(date, []).extend(entries)
     return days
 
 
+def _parse_dd(dd, cat: str) -> dict:
+    if dd is None:
+        return {"announce_type": "new"}
+
+    def field(cls):
+        node = dd.select_one(cls)
+        if not node:
+            return ""
+        desc = node.select_one(".descriptor")
+        if desc:
+            desc.extract()
+        for a in node.find_all("a", href=True):  # 列表页把网址显示成“this https URL”，换回真实地址
+            a.replace_with(a["href"])
+        return _clean(node.get_text(" "))
+
+    primary = dd.select_one(".primary-subject")
+    subjects = field(".list-subjects")
+    return {
+        "announce_type": "cross" if primary and f"({cat})" not in primary.get_text() else "new",
+        "title": field(".list-title"),
+        "authors": [_clean(a.get_text()) for a in dd.select(".list-authors a")],
+        "comments": field(".list-comments"),
+        "subjects": re.findall(r"\(([\w.-]+)\)", subjects),
+    }
+
+
 def fetch_rss(cat: str) -> tuple[str | None, list[dict]]:
-    """RSS 兜底：只含最新一天，返回 (日期, 条目)。"""
+    """RSS：只含最新一个公告日，但带摘要。返回 (日期, 条目)。"""
     feed = feedparser.parse(net.get(RSS_URL.format(cat=cat)).content)
     out, date = [], None
     for e in feed.entries:
@@ -52,21 +79,42 @@ def fetch_rss(cat: str) -> tuple[str | None, list[dict]]:
         if atype.startswith("replace"):
             continue
         aid = e.link.rsplit("/", 1)[-1]
-        out.append({"id": aid, "announce_type": atype})
+        desc = e.get("summary", "")
+        abstract = desc.split("Abstract:", 1)[1] if "Abstract:" in desc else desc
+        out.append({
+            "id": aid, "announce_type": atype, "title": _clean(e.get("title", "")),
+            "authors": [_clean(x) for x in e.get("author", "").split(",") if x.strip()],
+            "abstract": _clean(abstract), "comments": "",
+            "subjects": [t.get("term") for t in e.get("tags", [])],
+        })
         if not date and e.get("published_parsed"):
             date = time.strftime("%Y-%m-%d", e.published_parsed)
     return date, out
 
 
 def fetch_metadata(ids: list[str]) -> list[dict]:
-    """通过 arXiv API 批量取元数据（标题、摘要、作者、comments、分类）。"""
+    """通过 arXiv API 批量取元数据。arXiv 要求请求间隔 ≥3 秒，被限流（429）时按 Retry-After 或指数退避重试。"""
     out = []
-    for i in range(0, len(ids), 100):
-        chunk = ids[i:i + 100]
-        r = net.get(API_URL, params={"id_list": ",".join(chunk), "max_results": len(chunk)}, timeout=90)
-        out.extend(parse_api_feed(r.content))
-        if i + 100 < len(ids):
-            time.sleep(3.1)  # arXiv API 要求请求间隔 ≥3s
+    for i in range(0, len(ids), 50):
+        chunk = ids[i:i + 50]
+        if i:
+            time.sleep(3.5)
+        for attempt in range(4):
+            try:
+                r = net.get(API_URL, params={"id_list": ",".join(chunk), "max_results": len(chunk)},
+                            timeout=90, retries=1)
+                out.extend(parse_api_feed(r.content))
+                break
+            except Exception as e:  # noqa: BLE001
+                resp = getattr(e, "response", None)
+                if attempt == 3:
+                    if resp is not None and resp.status_code == 429:
+                        raise RuntimeError("arXiv API 限流（HTTP 429），请过几分钟再试") from e
+                    raise
+                wait = 5 * 2 ** attempt
+                if resp is not None and resp.headers.get("retry-after", "").isdigit():
+                    wait = max(wait, int(resp.headers["retry-after"]))
+                time.sleep(min(wait, 60))
     return out
 
 
@@ -204,9 +252,10 @@ def extract_links(comments: str, abstract: str, header: str) -> list[dict]:
     for src in (comments, abstract, header):
         for u in URL_RE.findall(src or ""):
             u = u.rstrip(".")
-            if u in seen or "arxiv.org" in u or "creativecommons" in u or "doi.org" in u:
+            key = u.rstrip("/").lower()
+            if key in seen or "arxiv.org" in u or "creativecommons" in u or "doi.org" in u:
                 continue
-            seen.add(u)
+            seen.add(key)
             label = ("代码" if "github.com" in u or "gitlab" in u else
                      "数据/模型" if "huggingface.co" in u else "视频" if "youtu" in u else "项目主页")
             links.append({"label": label, "url": u})
